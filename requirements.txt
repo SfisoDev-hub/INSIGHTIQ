@@ -1,11 +1,7 @@
-langchain
-langchain-community
-langchain-pinecone
-langchain-groq
-langchain-text-splitters
 python-dotenv
 fastapi
 uvicorn[standard]
 supabase
-pydantic-settings
-sentence-transformers
+pinecone
+huggingface-hub
+groq

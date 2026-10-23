@@ -1,97 +1,52 @@
+"""RAG retrieval using hosted MiniLM embeddings to keep the API memory-light."""
 import os
 
 from dotenv import load_dotenv
+from groq import Groq
+from huggingface_hub import InferenceClient
 from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
-from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv()
 
-# 1. Connect to Pinecone
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index = pc.Index("telecom-feedback")
-
-# 2. Load the same embedding model used during ingestion
-embedding_model = SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# 3. Initialize the LLM
-llm = ChatGroq(
-    model="openai/gpt-oss-20b",
-    temperature=0
-)
+MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+INDEX_NAME = "telecom-feedback"
 
 
-# 4. Create a reusable RAG function
-def generate_answer(question: str):
+def generate_answer(question: str) -> dict:
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN is missing. Add a Hugging Face access token to Render environment variables.")
 
-    # 5. Convert the user's question into an embedding
-    query_vector = embedding_model.encode(question).tolist()
+    # Hosted inference: does not load PyTorch or model weights in this process.
+    embedding_client = InferenceClient(token=token)
+    try:
+        vector = embedding_client.feature_extraction(question, model=MODEL_ID)
+    except Exception as exc:
+        raise RuntimeError(
+            "Hosted MiniLM embedding request failed. Confirm this model is available "
+            "for feature extraction on your Hugging Face account/provider."
+        ) from exc
 
-    # 6. Retrieve relevant comments from Pinecone
-    results = index.query(
-        vector=query_vector,
-        top_k=3,
-        include_metadata=True
+    query_vector = vector.tolist() if hasattr(vector, "tolist") else list(vector)
+    # Mean-pooling is not equivalent to sentence-transformer pooling; the hosted
+    # feature-extraction endpoint must return a sentence-level 384-d vector.
+    if len(query_vector) != 384 or any(isinstance(v, (list, tuple)) for v in query_vector):
+        raise RuntimeError("Embedding service did not return a 384-dimensional sentence vector.")
+
+    index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(INDEX_NAME)
+    results = index.query(vector=query_vector, top_k=3, include_metadata=True)
+    comments = [str((match.metadata or {}).get("post_text", "")) for match in results.matches]
+    comments = [comment for comment in comments if comment]
+    if not comments:
+        return {"question": question, "answer": "There is insufficient information in the retrieved customer comments.", "sources": []}
+
+    context = "\n".join(f"{i}. {comment}" for i, comment in enumerate(comments, 1))
+    response = Groq(api_key=os.environ["GROQ_API_KEY"]).chat.completions.create(
+        model="openai/gpt-oss-20b",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": "You are a telecom customer feedback analyst. Answer using ONLY the supplied customer comments. Do not invent information. If insufficient, say so."},
+            {"role": "user", "content": f"Customer comments:\n{context}\n\nQuestion:\n{question}"},
+        ],
     )
-
-    comments = [
-        match.metadata["post_text"]
-        for match in results.matches
-    ]
-
-    # 7. Prepare retrieved comments as context
-    context = "\n".join(
-        f"{i}. {comment}"
-        for i, comment in enumerate(comments, start=1)
-    )
-
-    # 8. Generate a grounded answer using Groq
-    messages = [
-        SystemMessage(content="""
-You are a telecom customer feedback analyst.
-
-Answer questions using ONLY the customer comments provided.
-
-Do not invent information or make unsupported assumptions.
-
-If the comments do not contain enough information,
-say that there is insufficient information.
-"""),
-        HumanMessage(content=f"""
-Customer comments:
-{context}
-
-Question:
-{question}
-""")
-    ]
-
-    response = llm.invoke(messages)
-
-    # 9. Return the answer and retrieved sources
-    return {
-        "question": question,
-        "answer": response.content,
-        "sources": comments
-    }
-
-
-# 10. Allow direct testing from the terminal
-if __name__ == "__main__":
-
-    question = "What internet problems are customers experiencing?"
-
-    result = generate_answer(question)
-
-    print("\nQUESTION:")
-    print(result["question"])
-
-    print("\nRETRIEVED COMMENTS:")
-    for comment in result["sources"]:
-        print(f"- {comment}")
-
-    print("\nLLM ANSWER:")
-    print(result["answer"])
+    return {"question": question, "answer": response.choices[0].message.content, "sources": comments}
